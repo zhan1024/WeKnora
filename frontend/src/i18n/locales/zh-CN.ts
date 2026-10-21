@@ -5619,7 +5619,7 @@ export default {
     }
   },
   createChat: {
-    title: 'Hi，我是 WeKnora，让你的知识触手可及',
+    title: 'Hi，我是 WenHong，让你的知识触手可及',
     newSessionTitle: '新会话',
     openProject: '选择项目',
     clearProject: '取消绑定',
