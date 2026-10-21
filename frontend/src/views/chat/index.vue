@@ -25,7 +25,9 @@
                 </t-tooltip>
             </div>
         </div>
-        <div class="chat_thread" :style="{ '--chat-composer-height': `${composerHeight}px`, '--chat-scrollbar-gutter': `${scrollbarGutter}px` }">
+        <ChildAgentTabBar v-if="!inheritedChildTabs && childTabs.tabs.value.length" :tabs="childTabs.tabs.value"
+            :active-id="childTabs.activeId.value" :attention="promptDock.prompts.value.length > 0" @select="childTabs.select" @close="childTabs.close" />
+        <div v-show="!childTabs.activeId.value" class="chat_thread" :style="{ '--chat-composer-height': `${composerHeight}px`, '--chat-scrollbar-gutter': `${scrollbarGutter}px` }">
             <div ref="scrollContainer" class="chat_scroll_box" @scroll="handleScroll">
                 <div class="chat_scroll_content">
                     <div class="msg_list" :class="{ 'is-embedded': embeddedMode }">
@@ -49,7 +51,7 @@
                             </div>
                         </div>
                         <!-- 推荐问题卡片 - 仅在新会话（无消息）时展示 -->
-                        <div v-if="!embeddedMode && messagesList.length === 0 && !loading"
+                        <div v-if="!embeddedMode && currentSession && !isAutomationSession && messagesList.length === 0 && !loading"
                             class="suggested-questions-container"
                             :class="{ 'has-questions': suggestedQuestions.length > 0 || suggestedQuestionsLoading }">
                             <!-- 骨架屏占位 -->
@@ -138,7 +140,7 @@
                                     @ask-assistant="handleAskAssistant"
                                     @render-complete-change="(ready) => handleAnswerRenderComplete(session, ready)">
                                 </botmsg>
-                                <FollowUpSuggestions v-if="session.answerFullyRendered && !session.steerForked && !session.suggestionsDismissed"
+                                <FollowUpSuggestions v-if="!isAutomationSession && session.answerFullyRendered && !session.steerForked && !session.suggestionsDismissed"
                                     :suggestion-set="session.suggestionSet"
                                     :loading="session.suggestionLoading"
                                     :allow-regenerate="session.suggestionSet?.allow_regenerate"
@@ -163,7 +165,11 @@
                         </div>
                     </transition>
                     <PendingPromptDock :embedded-mode="embeddedMode" />
-                    <InputField ref="inputFieldRef" :auto-focus="focusComposerOnMount" compact
+                    <div v-if="isAutomationSession" class="automation-session-notice" role="note">
+                        <t-icon name="time" size="14px" />
+                        <span>{{ t('automation.conversationNotice') }}</span>
+                    </div>
+                    <InputField v-else-if="embeddedMode || currentSession" ref="inputFieldRef" :auto-focus="focusComposerOnMount" compact
                         @send-msg="(query, modelId, mentionedItems, imageFiles, attachmentFiles, options) => sendMsg(query, modelId, mentionedItems, imageFiles, attachmentFiles, options)"
                         @steer-msg="(query, mentionedItems, delivery) => handleSteerMsg(query, mentionedItems, delivery)"
                         @promote-steer="handlePromoteSteer"
@@ -187,6 +193,9 @@
                     @jump="jumpToQuestion" />
             </div>
         </div>
+        <div v-for="tab in childTabs.tabs.value" :key="tab.id" v-show="childTabs.activeId.value === tab.id" class="chat-child-detail" role="tabpanel" :aria-label="tab.task.displayName">
+            <ChildAgentStream :key="tab.task.sessionId + ':' + tab.task.runId" :task="tab.task" :active="childTabs.activeId.value === tab.id" />
+        </div>
     </div>
     <KnowledgeBaseEditorModal v-if="!embeddedMode" :visible="uiStore.showKBEditorModal" :mode="uiStore.kbEditorMode"
         :kb-id="uiStore.currentKBId || undefined" :initial-type="uiStore.kbEditorType"
@@ -202,9 +211,12 @@
         @artifact-deleted="handleArtifactDeleted" />
 </template>
 <script setup>
+import ChildAgentTabBar from './components/ChildAgentTabBar.vue';
+import ChildAgentStream from './components/ChildAgentStream.vue';
+import { createChildAgentTabs, childAgentTabsKey, childAgentTaskLookupKey, findChildAgentTask } from '@/composables/useChildAgentTabs';
 import { makeSteerClientId } from '@/utils/steerId';
 import { storeToRefs } from 'pinia';
-import { ref, onMounted, onBeforeMount, onUnmounted, nextTick, watch, reactive, computed, provide } from 'vue';
+import { inject, ref, onMounted, onBeforeMount, onUnmounted, nextTick, watch, reactive, computed, provide } from 'vue';
 import { useRoute, useRouter, onBeforeRouteLeave, onBeforeRouteUpdate } from 'vue-router';
 import InputField from '../../components/Input-field.vue';
 import botmsg from './components/botmsg.vue';
@@ -229,7 +241,7 @@ import { useUIStore } from '@/stores/ui';
 import KnowledgeBaseEditorModal from '@/views/knowledge/KnowledgeBaseEditorModal.vue';
 import { useKnowledgeBaseCreationNavigation } from '@/hooks/useKnowledgeBaseCreationNavigation';
 import { useChatStreamHandler, isAwaitingInput, isPromptCard } from '@/composables/useChatStreamHandler';
-import { useStickyBottomOnResize } from '@/composables/useStickyBottomOnResize';
+import { useChatScrollFollow } from '@/composables/useChatScrollFollow';
 import { clearCitationChunkCache } from '@/utils/citationChunkCache';
 import ChatReferencesDrawer from '@/components/ChatReferencesDrawer.vue';
 import ChatAttachmentPreviewDrawer from '@/components/ChatAttachmentPreviewDrawer.vue';
@@ -260,6 +272,9 @@ import PendingPromptDock from './components/PendingPromptDock.vue';
 import { providePromptDock } from '@/composables/usePromptDock';
 import { collectSessionArtifacts, markSessionArtifactDeleted } from '@/utils/sessionArtifacts';
 import { isCollectingSkillArtifacts } from '@/utils/skillArtifacts';
+const inheritedChildTabs = inject(childAgentTabsKey, null);
+const childTabs = inheritedChildTabs || createChildAgentTabs();
+provide(childAgentTabsKey, childTabs);
 const referencesDrawer = provideChatReferencesDrawer();
 provideChatAttachmentPreviewDrawer();
 const sandboxPanel = provideChatSandboxPanel();
@@ -328,7 +343,9 @@ const attachStreamDebugToMessage = (message) => {
 const route = useRoute();
 const router = useRouter();
 const session_id = ref(props.session_id || route.params.chatid);
+watch(session_id, () => childTabs.reset(), { flush: 'sync' });
 const currentSession = ref(null);
+const isAutomationSession = computed(() => currentSession.value?.kind === 'automation');
 
 // 拉 session 详情，并按其 last_request_state 把输入栏状态恢复到当时的发起态。
 // 嵌入式（embeddedMode）由宿主页面注入 agent/KB，所以跳过整套恢复逻辑，
@@ -353,7 +370,10 @@ const inputFieldRef = ref();
 const created_at = ref('');
 const limit = ref(20);
 const messagesList = reactive([]);
-providePromptDock(messagesList);
+provide(childAgentTaskLookupKey, task => findChildAgentTask(messagesList, task));
+const promptDock = providePromptDock(messagesList);
+watch(promptDock.focusRequest, () => childTabs.select(''), { flush: 'sync' });
+watch(promptDock.prompts, prompts => { childTabs.attention.value = prompts.length > 0; }, { immediate: true });
 
 // The answer the user asked the assistant about, until they leave the session.
 const assistant = useAssistantStore();
@@ -370,7 +390,7 @@ function handleAskAssistant(messageId) {
 }
 
 function forkAffordanceOf(messageId) {
-    if (!messageId) return { canFork: false }
+    if (isAutomationSession.value || !messageId) return { canFork: false }
     return resolveForkAffordance(messagesList, messageId)
 }
 
@@ -382,7 +402,7 @@ const rewindableIds = computed(() => rewindableMessageIds(messagesList, {
 }))
 
 function canRewindMessage(messageId) {
-    return Boolean(messageId) && rewindableIds.value.has(String(messageId))
+    return !isAutomationSession.value && Boolean(messageId) && rewindableIds.value.has(String(messageId))
 }
 
 const FORK_PREFILL_KEY = 'weknora:fork-prefill'
@@ -390,7 +410,7 @@ let forkInFlight = false
 const rewindInFlight = ref(false)
 const rewindLockSessionId = ref('')
 const composerLocked = computed(() =>
-    rewindInFlight.value && String(session_id.value || '') === rewindLockSessionId.value
+    isAutomationSession.value || (rewindInFlight.value && String(session_id.value || '') === rewindLockSessionId.value)
 )
 
 function stashForkLanding(sessionId, text) {
@@ -650,11 +670,6 @@ watch([composerElement, scrollContainer], ([element, scroller], _, onCleanup) =>
 const userHasScrolledUp = ref(false)
 const SCROLL_BOTTOM_THRESHOLD = 80
 
-const isNearBottom = () => {
-    if (!scrollContainer.value) return true;
-    const { scrollTop, scrollHeight, clientHeight } = scrollContainer.value;
-    return scrollHeight - scrollTop - clientHeight < SCROLL_BOTTOM_THRESHOLD;
-}
 
 const jumpToQuestion = (id) => {
     const root = scrollContainer.value
@@ -747,6 +762,7 @@ const handleAnswerRenderComplete = (message, ready) => {
 };
 
 const loadFollowUpSuggestions = async (message, ensure = false, regenerate = false) => {
+    if (isAutomationSession.value) return;
     const messageId = resolveAssistantMessageId(message);
     const targetSessionId = session_id.value;
     if (!messageId || !targetSessionId || message.suggestionsDismissed) return;
@@ -874,23 +890,20 @@ watch([() => route.params], async (newvalue) => {
         getmsgList(data);
     }
 });
-const scrollToBottom = (force = false) => {
-    if (!force && userHasScrolledUp.value) return;
-    nextTick(() => {
-        if (scrollContainer.value) {
-            scrollContainer.value.scrollTop = scrollContainer.value.scrollHeight;
-        }
-    })
-}
-const onClickScrollToBottom = () => {
-    userHasScrolledUp.value = false;
-    scrollToBottom(true);
-}
+const scrollFollow = useChatScrollFollow(scrollContainer, userHasScrolledUp, computed(() => !childTabs.activeId.value));
+const scrollToBottom = scrollFollow.scrollToBottom;
+const onClickScrollToBottom = scrollFollow.resume;
 
-// Images and other rich Markdown content can grow after the SSE chunk that
-// introduced them. Follow those delayed height changes while the user remains
-// at the live edge; preserve position when they intentionally scroll upward.
-useStickyBottomOnResize(scrollContainer, userHasScrolledUp);
+let parentTabScrollTop = 0;
+watch(childTabs.activeId, (active, previous) => {
+    if (!previous && active) parentTabScrollTop = scrollContainer.value?.scrollTop || 0;
+    if (!active) nextTick(() => {
+        if (scrollContainer.value) {
+            scrollContainer.value.scrollTop = parentTabScrollTop;
+            scrollFollow.rememberPosition();
+        }
+    });
+});
 
 const debounce = (fn, delay) => {
     let timer
@@ -900,6 +913,7 @@ const debounce = (fn, delay) => {
     }
 }
 const onChatScrollTop = () => {
+    if (childTabs.activeId.value) return;
     if (scrollLock.value || historyLoadingMore.value || !hasMoreHistory.value) return;
     if (!scrollContainer.value) return;
     const { scrollTop, scrollHeight } = scrollContainer.value;
@@ -914,22 +928,9 @@ const onChatScrollTop = () => {
     }
 }
 const debouncedScrollTop = debounce(onChatScrollTop, 500);
-let lastScrollTop = 0;
 const handleScroll = () => {
-    const el = scrollContainer.value;
-    if (el) {
-        const currentTop = el.scrollTop;
-        // Only an actual upward scroll detaches from the live edge. Content that
-        // grows after a chunk (images, diagrams) keeps scrollTop fixed and would
-        // otherwise fire a stale scroll event that falsely marks the user as
-        // scrolled up, killing the auto-follow during streaming.
-        if (currentTop < lastScrollTop - 1) {
-            userHasScrolledUp.value = !isNearBottom();
-        } else if (isNearBottom()) {
-            userHasScrolledUp.value = false;
-        }
-        lastScrollTop = currentTop;
-    }
+    if (childTabs.activeId.value) return;
+    scrollFollow.onScroll();
     debouncedScrollTop();
 };
 
@@ -1422,6 +1423,10 @@ const attachSteerFollowUp = async (completedAssistantId) => {
 };
 
 const sendMsg = async (value, modelId = '', mentionedItems = [], imageFiles = [], attachmentFiles = [], options = {}) => {
+    if (!props.embeddedMode && !currentSession.value) {
+        await loadSessionAndHydrate(session_id.value);
+        if (!currentSession.value) return;
+    }
     if (composerLocked.value) return
     const reasoningEffort = props.embeddedMode ? undefined : (useSettingsStoreInstance.reasoningEffortOverride || undefined);
     stopStream();
@@ -1677,7 +1682,7 @@ const resumeSuspendedRun = async (pendingId) => {
     currentAssistantMessageId.value = resumeId;
     attachingResumedRun = true;
     try {
-        for (let attempt = 0; attempt < 10; attempt++) {
+        for (let attempt = 0; attempt < 60; attempt++) {
             await new Promise((resolve) => setTimeout(resolve, 500));
             if (session_id.value !== sessionId) return;
             await startStream({
@@ -1685,6 +1690,7 @@ const resumeSuspendedRun = async (pendingId) => {
                 query: resumeId,
                 method: 'GET',
                 url: '/api/v1/sessions/continue-stream',
+                resume_pending_id: pendingId,
             });
             if (!error.value) return;
         }
@@ -1865,6 +1871,7 @@ onBeforeRouteUpdate((to, from, next) => {
 })
 </script>
 <style lang="less" scoped>
+@import '../../components/css/chat-scrollbar.less';
 .chat {
     // 水平方向不留 padding，让滚动条贴到内容区最右缘；
     // 消息列与输入列各自用 --chat-content-inset 做左右对称的留白（窄屏时才可见）。
@@ -1954,6 +1961,8 @@ onBeforeRouteUpdate((to, from, next) => {
     }
 }
 
+.chat-child-detail { flex: 1; min-height: 0; width: 100%; overflow: hidden; }
+
 .chat_thread {
     position: relative;
     flex: 1;
@@ -2018,32 +2027,7 @@ onBeforeRouteUpdate((to, from, next) => {
     // Keep native message bounce without chaining scroll to the outer page.
     overscroll-behavior-y: contain;
     scroll-padding-bottom: var(--chat-composer-height, 0px);
-    scrollbar-gutter: stable;
-    scrollbar-width: thin;
-    scrollbar-color: var(--td-component-stroke) transparent;
-
-    &:hover,
-    &:focus-within {
-        scrollbar-color: var(--td-scrollbar-color) transparent;
-    }
-
-    &::-webkit-scrollbar {
-        width: 6px;
-    }
-
-    &::-webkit-scrollbar-track {
-        background: transparent;
-    }
-
-    &::-webkit-scrollbar-thumb {
-        border-radius: 6px;
-        background: var(--td-component-stroke);
-    }
-
-    &:hover::-webkit-scrollbar-thumb,
-    &:focus-within::-webkit-scrollbar-thumb {
-        background: var(--td-scrollbar-color);
-    }
+    .chat-scrollbar();
 }
 
 // Keep the full-height message scrollbar and reserve space below the last
@@ -2182,6 +2166,19 @@ onBeforeRouteUpdate((to, from, next) => {
         box-sizing: border-box;
         overflow-x: clip;
     }
+}
+
+.automation-session-notice {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 16px 0;
+    color: var(--td-text-color-secondary);
+    font-size: var(--app-text-sm);
+    line-height: 1.6;
+
+    > .t-icon { flex-shrink: 0; }
 }
 
 .msg_list {
