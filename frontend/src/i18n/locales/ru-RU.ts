@@ -4832,6 +4832,12 @@ export default {
     noKnowledgeBases: 'Нет доступных баз знаний',
     enterDescription: 'Введите описание',
     rawOutputLabel: 'Исходный вывод',
+    backgroundWork: {
+      running: 'Нет фоновых задач | {count} фоновая задача | {count} фоновых задач',
+      stop: 'Остановить',
+      loading: 'Загрузка вывода…',
+      unavailable: 'Вывод недоступен',
+    },
     wikiWritePageTitle: 'Запись страницы Wiki',
     wikiReplaceTextTitle: 'Замена текста Wiki',
     wikiRenamePageTitle: 'Переименование страницы Wiki',
