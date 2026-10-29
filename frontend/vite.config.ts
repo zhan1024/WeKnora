@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs'
 import { execSync } from 'node:child_process'
 import { copyPdfJsWasm } from './scripts/copy-pdfjs-wasm.mjs'
 import { createRequire } from 'node:module'
-import { defineConfig, type Plugin } from 'vite'
+import { defineConfig, loadEnv, type Plugin } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import vueJsx from '@vitejs/plugin-vue-jsx'
 
@@ -51,6 +51,8 @@ function embedHtmlDevFallback(): Plugin {
 const DEV_PROXY_TARGET =
   process.env.VITE_DEV_PROXY_TARGET ||
   process.env.FRONTEND_BACKEND_URL ||
+  // .env/.env.local 不会自动注入配置文件的 process.env，这里显式加载
+  loadEnv(process.env.NODE_ENV ?? 'development', __dirname, 'VITE_').VITE_DEV_PROXY_TARGET ||
   'http://localhost:8080'
 
 function resolveVueOfficePptxEntry(): string {

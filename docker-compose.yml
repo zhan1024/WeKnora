@@ -585,6 +585,10 @@ services:
   postgres:
     image: paradedb/paradedb:v0.25.11-pg17
     container_name: WeKnora-postgres
+    # 映射到宿主机回环地址，供本机数据库客户端（DBX/DBeaver 等）连接；
+    # 仅 127.0.0.1，不对局域网/公网暴露数据库。
+    ports:
+      - "127.0.0.1:5432:5432"
     environment:
       - POSTGRES_USER=${DB_USER}
       - POSTGRES_PASSWORD=${DB_PASSWORD}

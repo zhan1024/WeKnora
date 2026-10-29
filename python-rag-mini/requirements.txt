@@ -1,0 +1,12 @@
+langchain-core>=0.3
+langchain-text-splitters>=0.3
+rank-bm25>=0.2.2
+numpy>=1.26
+# 文档解析(可选,缺省时 .pdf 文件解析会报清晰错误)
+pypdf>=4.0
+# 可选:配置 OPENAI_API_KEY 后安装,启用真实 embedding / LLM / 重排 / 流式
+langchain-openai>=0.2
+
+# HTTP/SSE 服务
+fastapi>=0.115
+uvicorn[standard]>=0.30
