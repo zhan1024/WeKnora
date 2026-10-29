@@ -1,4 +1,5 @@
 import { emitAssistantDataChange } from '@/utils/assistantDataChange'
+import { approvalEventFromRecord, clearComposerApproval, showComposerApproval } from '@/views/chat/components/hostApproval'
 import { applyFinalArtifactContent } from '@/utils/finalArtifactContent'
 import { markRaw, nextTick, type Ref } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -528,6 +529,11 @@ export function useChatStreamHandler(options: UseChatStreamHandlerOptions) {
           })
         }
 
+        const approvals = Array.isArray(step.approvals) ? step.approvals as ChatMessage[] : []
+        approvals.forEach((record) => {
+          events.push(approvalEventFromRecord(record))
+        })
+
         if (toolCalls && Array.isArray(toolCalls)) {
           toolCalls.forEach((toolCall: ChatMessage) => {
             if (toolCall.name === 'final_answer') return
@@ -800,6 +806,15 @@ export function useChatStreamHandler(options: UseChatStreamHandlerOptions) {
     }
 
     if (!message) {
+      // Background notices attach to a turn that already exists. Opening a
+      // shell here would start a new assistant turn after the parent run.
+      if (
+        data.response_type === 'work_event' ||
+        data.response_type === 'work_started' ||
+        data.response_type === 'work_finished'
+      ) {
+        return
+      }
       const newMsg: ChatMessage = {
         id: dataId,
         request_id: dataId,
@@ -851,6 +866,9 @@ export function useChatStreamHandler(options: UseChatStreamHandlerOptions) {
         .filter(m => m.role === 'assistant' && (m === message || (turnID && persistedAssistantId(m) === turnID)))
         .flatMap(m => (m.agentEventStream as ChatMessage[] | undefined) || [])
     }
+    // work_* cases read `payload` so the source-extracted tests, which call
+    // the case with the event object, and this handler share one binding.
+    const payload = dataPayload
 
     switch (responseType) {
       case 'collaboration_status': {
@@ -977,7 +995,7 @@ export function useChatStreamHandler(options: UseChatStreamHandlerOptions) {
         if (!message.agentEventStream) message.agentEventStream = []
         const d = dataPayload || {}
         if (turnPromptEvents().some(e => e.pending_id === d.pending_id)) break
-        ;(message.agentEventStream as ChatMessage[]).push({
+        const approvalEvent = {
           type: 'tool_approval_required',
           pending_id: d.pending_id,
           service_name: d.service_name,
@@ -994,8 +1012,18 @@ export function useChatStreamHandler(options: UseChatStreamHandlerOptions) {
           expires_at: d.expires_at,
           requested_at: d.requested_at,
           tool_call_id: d.tool_call_id,
+          kind: d.kind,
+          host: d.host,
           resolved: false,
-        })
+        }
+        // Replace the array. A markRaw stream ignores push, so the open chat
+        // stayed on "running" until a session reload rebuilt it.
+        message.agentEventStream = [
+          ...(message.agentEventStream as ChatMessage[]),
+          approvalEvent,
+        ]
+        message.pendingHostApproval = approvalEvent
+        showComposerApproval(approvalEvent)
         break
       }
       case 'agent_prompt_required': {
@@ -1068,7 +1096,14 @@ export function useChatStreamHandler(options: UseChatStreamHandlerOptions) {
           ev.resolve_reason = d.reason
           ev.timed_out = d.timed_out
           ev.canceled = d.canceled
+          ev.resolve_scope = d.scope
+          message.agentEventStream = [...(message.agentEventStream as ChatMessage[])]
         }
+        const pending = message.pendingHostApproval as { pending_id?: string } | undefined
+        if (pending && pending.pending_id === pid) {
+          message.pendingHostApproval = null
+        }
+        clearComposerApproval(typeof pid === 'string' ? pid : undefined)
         break
       }
       case 'mcp_oauth_required': {
@@ -1195,6 +1230,44 @@ export function useChatStreamHandler(options: UseChatStreamHandlerOptions) {
         }
         break
       }
+      case 'work_event': {
+        const inner = dataPayload?.inner as { response_type?: string; data?: ChatMessage } | undefined
+        if (inner?.response_type === 'command_output' && inner.data?.tool_call_id) {
+          // The async tool returns at the yield window, so later previews
+          // arrive after pending is cleared. Attach them to that card anyway.
+          // done on the preview hides the live tail; it does not complete the tool.
+          const toolCallId = inner.data.tool_call_id
+          const tool = (message.agentEventStream as ChatMessage[] | undefined)?.find(
+            event => event.type === 'tool_call' && event.tool_call_id === toolCallId
+              && (event.tool_name === 'shell_exec' || event.tool_name === 'shell_exec_async'),
+          )
+          if (tool) {
+            tool.command_output = { ...inner.data }
+          }
+        }
+        break
+      }
+      case 'work_started':
+      case 'work_finished': {
+        const event = payload as ChatMessage | undefined
+        const workId = typeof event?.work_id === 'string' ? event.work_id : ''
+        if (workId) {
+          if (!message.background_work) message.background_work = {}
+          const backgroundWork = message.background_work as Record<string, {
+            state: unknown
+            title: unknown
+            kind: unknown
+            payload: unknown
+          }>
+          backgroundWork[workId] = {
+            state: (event?.state as string | undefined) ?? 'running',
+            title: event?.title,
+            kind: event?.kind,
+            payload: event?.payload,
+          }
+        }
+      }
+      break
       case 'tool_result':
       case 'error': {
         if (dataPayload) {
@@ -1591,6 +1664,9 @@ export function useChatStreamHandler(options: UseChatStreamHandlerOptions) {
       data.response_type === 'tool_call' ||
       data.response_type === 'tool_result' ||
       data.response_type === 'command_output' ||
+      data.response_type === 'work_event' ||
+      data.response_type === 'work_started' ||
+      data.response_type === 'work_finished' ||
       data.response_type === 'reflection' ||
       data.response_type === 'artifacts_pending' ||
       data.response_type === 'context_compacted' ||
@@ -1598,7 +1674,11 @@ export function useChatStreamHandler(options: UseChatStreamHandlerOptions) {
       data.response_type === 'run_suspended' ||
       data.response_type === 'run_resumed' ||
       data.response_type === 'agent_prompt_required' ||
-      data.response_type === 'agent_prompt_resolved'
+      data.response_type === 'agent_prompt_resolved' ||
+      data.response_type === 'tool_approval_required' ||
+      data.response_type === 'tool_approval_resolved' ||
+      data.response_type === 'mcp_oauth_required' ||
+      data.response_type === 'mcp_oauth_resolved'
 
     const activeAssistant = getTrailingIncompleteAssistant()
     const isCurrentlyAgentMode = activeAssistant?.isAgentMode === true

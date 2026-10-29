@@ -182,6 +182,7 @@ type sessionService struct {
 	// remote resolver) keeps the historical delete path and writes no
 	// allocation rows.
 	workspaceCleaner *sandboxalloc.WorkspaceCleaner
+	background       *BackgroundWork
 }
 
 // NewSessionService creates a new session service instance with all required dependencies
@@ -208,6 +209,7 @@ func NewSessionService(cfg *config.Config,
 	sandboxConfigRepo repository.TenantSandboxConfigRepository,
 	tenantSkillRepo repository.TenantSkillRepository,
 	busyGate *SessionBusyGate,
+	backgroundWork *BackgroundWork,
 ) interfaces.SessionService {
 	return &sessionService{
 		cfg:                   cfg,
@@ -235,6 +237,7 @@ func NewSessionService(cfg *config.Config,
 		sandboxConfigRepo:     sandboxConfigRepo,
 		tenantSkillRepo:       tenantSkillRepo,
 		busyGate:              busyGate,
+		background:            backgroundWork,
 	}
 }
 
@@ -533,7 +536,7 @@ func (s *sessionService) UpdateSessionLastRequestState(
 }
 
 // DeleteSession removes a session by its ID
-func (s *sessionService) DeleteSession(ctx context.Context, id string) error {
+func (s *sessionService) DeleteSession(ctx context.Context, id string) (deleteErr error) {
 	// Validate session ID
 	if id == "" {
 		logger.Error(ctx, "Failed to delete session: session ID cannot be empty")
@@ -553,6 +556,12 @@ func (s *sessionService) DeleteSession(ctx context.Context, id string) error {
 	if err != nil {
 		return fmt.Errorf("read sandbox workspace: %w", err)
 	}
+
+	finishBackgroundDelete, err := s.beginBackgroundDelete(ctx, []*types.Session{session})
+	if err != nil {
+		return fmt.Errorf("stop background work before deleting session: %w", err)
+	}
+	defer func() { finishBackgroundDelete(deleteErr == nil) }()
 
 	// Cleanup chat history knowledge entries for this session (async, best-effort).
 	// Use WithoutCancel so the goroutine survives after the HTTP request context is done.
@@ -633,7 +642,7 @@ func (s *sessionService) notifyDeletedSessions(ctx context.Context, tenantID uin
 }
 
 // BatchDeleteSessions deletes multiple sessions by IDs
-func (s *sessionService) BatchDeleteSessions(ctx context.Context, ids []string) error {
+func (s *sessionService) BatchDeleteSessions(ctx context.Context, ids []string) (deleteErr error) {
 	if len(ids) == 0 {
 		logger.Error(ctx, "Failed to batch delete sessions: IDs list is empty")
 		return stderrors.New("session ids are required")
@@ -664,6 +673,12 @@ func (s *sessionService) BatchDeleteSessions(ctx context.Context, ids []string) 
 	if err != nil {
 		return fmt.Errorf("read sandbox workspace: %w", err)
 	}
+
+	finishBackgroundDelete, err := s.beginBackgroundDelete(ctx, visible)
+	if err != nil {
+		return fmt.Errorf("stop background work before deleting session: %w", err)
+	}
+	defer func() { finishBackgroundDelete(deleteErr == nil) }()
 
 	// Cleanup associated resources for each session
 	bgCtx := context.WithoutCancel(ctx)
@@ -721,7 +736,7 @@ func (s *sessionService) BatchDeleteSessions(ctx context.Context, ids []string) 
 }
 
 // DeleteAllSessions deletes all sessions for the current tenant
-func (s *sessionService) DeleteAllSessions(ctx context.Context) error {
+func (s *sessionService) DeleteAllSessions(ctx context.Context) (deleteErr error) {
 	tenantID := types.MustTenantIDFromContext(ctx)
 	userID := sessionUserIDFromContext(ctx)
 	logger.Infof(ctx, "Deleting all sessions for tenant %d", tenantID)
@@ -745,6 +760,11 @@ func (s *sessionService) DeleteAllSessions(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("read sandbox workspace: %w", err)
 	}
+	finishBackgroundDelete, err := s.beginBackgroundDelete(ctx, sessions)
+	if err != nil {
+		return fmt.Errorf("stop background work before deleting session: %w", err)
+	}
+	defer func() { finishBackgroundDelete(deleteErr == nil) }()
 	bgCtx := context.WithoutCancel(ctx)
 	for _, session := range sessions {
 		if session == nil || session.ID == "" {
@@ -773,7 +793,10 @@ func (s *sessionService) DeleteAllSessions(ctx context.Context) error {
 
 	// Tear down sandboxes while session rows (and pins) are still readable.
 	for _, session := range sessions {
-		if session == nil || session.ID == "" || handled[session.ID] {
+		if session == nil || session.ID == "" {
+			continue
+		}
+		if handled[session.ID] {
 			continue
 		}
 		s.destroyBoundSandbox(ctx, session.ID)
@@ -876,6 +899,45 @@ func (s *sessionService) runUserWorkspaceCleanups(ctx context.Context, handled m
 	go s.workspaceCleaner.RunCleanups(bg, ids)
 }
 
+// beginBackgroundDelete closes feature submission gates while rows and pins
+// remain readable. Any failed stop or repository deletion must reopen all
+// attempted sessions, including earlier members of a failed batch.
+func (s *sessionService) beginBackgroundDelete(ctx context.Context, sessions []*types.Session) (func(bool), error) {
+	var attempted []*types.Session
+	finish := func(deleted bool) {
+		if deleted || s.background == nil || s.background.Listeners == nil {
+			return
+		}
+		for _, session := range attempted {
+			s.background.Listeners.NotifyDeleteAborted(context.WithoutCancel(ctx),
+				interfaces.SessionRef{TenantID: session.TenantID, SessionID: session.ID})
+		}
+	}
+	for _, session := range sessions {
+		if session == nil {
+			continue
+		}
+		attempted = append(attempted, session)
+		if err := s.notifyBackgroundDelete(ctx, session); err != nil {
+			finish(false)
+			return nil, err
+		}
+	}
+	return finish, nil
+}
+
+// notifyBackgroundDelete lets background features stop their work for a
+// session about to be deleted, then clears its activity items and notices.
+// Call it before destroyBoundSandbox, while features can still reach the
+// sandbox, and while the session row is still readable.
+func (s *sessionService) notifyBackgroundDelete(ctx context.Context, session *types.Session) error {
+	if s.background == nil || s.background.Listeners == nil || session == nil {
+		return nil
+	}
+	return s.background.Listeners.NotifyDelete(context.WithoutCancel(ctx),
+		interfaces.SessionRef{TenantID: session.TenantID, SessionID: session.ID})
+}
+
 // destroyBoundSandbox tears down the sandbox MicroVM bound to sessionID, if
 // the configured sandbox backend supports session-scoped instances.
 //
@@ -890,6 +952,9 @@ func (s *sessionService) runUserWorkspaceCleanups(ctx context.Context, handled m
 func (s *sessionService) destroyBoundSandbox(ctx context.Context, sessionID string) {
 	if sessionID == "" {
 		return
+	}
+	if releaser, ok := s.hostSandbox.(sandbox.SessionStateReleaser); ok {
+		releaser.ReleaseSessionState(ctx, sessionID)
 	}
 	// Resolve the workspace's own manager: the sandbox to release lives on
 	// whichever backend that workspace is configured for, not necessarily the
@@ -976,7 +1041,7 @@ func (s *sessionService) releaseForkSnapshots(ctx context.Context, sessions []*t
 }
 
 // GenerateTitle generates a title for the current conversation content
-// modelID: optional model ID to use for title generation (if empty, uses first available KnowledgeQA model)
+// modelID: optional model ID; when empty, uses the workspace utility/chat default.
 func (s *sessionService) GenerateTitle(ctx context.Context,
 	session *types.Session, messages []types.Message, modelID string,
 ) (string, error) {
@@ -1016,22 +1081,16 @@ func (s *sessionService) GenerateTitle(ctx context.Context,
 		return "", stderrors.New("no user message found")
 	}
 
-	// Use provided modelID, or fallback to first available KnowledgeQA model
+	// Use provided modelID, or fall back to the workspace utility/default chat model
 	if modelID == "" {
 		models, err := s.modelService.ListModels(ctx)
 		if err != nil {
 			logger.ErrorWithFields(ctx, err, nil)
 			return "", fmt.Errorf("failed to list models: %w", err)
 		}
-		for _, model := range models {
-			if model == nil {
-				continue
-			}
-			if model.Type == types.ModelTypeKnowledgeQA {
-				modelID = model.ID
-				logger.Infof(ctx, "Using first available KnowledgeQA model for title: %s", modelID)
-				break
-			}
+		if model := types.PickUtilityModel(models); model != nil {
+			modelID = model.ID
+			logger.Infof(ctx, "Using workspace default KnowledgeQA model for title: %s", modelID)
 		}
 		if modelID == "" {
 			logger.Error(ctx, "No KnowledgeQA model found")
